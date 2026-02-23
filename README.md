@@ -1,4 +1,5 @@
-# psyche-elastic
+# aftermath
+## earlier: psyche-elastic
 
 <p align="center" width="100%">
 <img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
