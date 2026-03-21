@@ -118,14 +118,14 @@ The loader prevents **double‑slicing** if a checkpoint is already tiered.
 
 ## Summary of additions over Psyche
 
-[x] MatFormer tier slices, manifests, and hub selective downloads
-[x] Metadata inference + schema canonicalization for mixed tiers
-[x] Heterogeneous gradient aggregation normalization
-[ ] Parameter tying, aggressive NanoGPT support (ongoing)
-[ ] Optimizer and kernel work (Muon, Polar Express) with tests (ongoing)
-[x] System metrics logging + fault injection tools
-[x] Packaging and local testnet improvements
-[ ] **Tensor parallelism with tier > 0** is not supported yet.
-[ ] **Helper mode** (suffix sampling) is disabled until sparse alignment/rotation is complete.
-[ ] Tier export currently assumes a **single `.safetensors` shard**.
+- [x] MatFormer tier slices, manifests, and hub selective downloads
+- [x] Metadata inference + schema canonicalization for mixed tiers
+- [x] Heterogeneous gradient aggregation normalization
+- [ ] Parameter tying, aggressive NanoGPT support (ongoing)
+- [ ] Optimizer and kernel work (Muon, Polar Express) with tests (ongoing)
+- [x] System metrics logging + fault injection tools
+- [x] Packaging and local testnet improvements
+- [ ] **Tensor parallelism with tier > 0** is not supported yet.
+- [ ] **Helper mode** (suffix sampling) is disabled until sparse alignment/rotation is complete.
+- [ ] Tier export currently assumes a **single `.safetensors` shard**.
 
