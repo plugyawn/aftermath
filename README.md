@@ -17,6 +17,9 @@ Highlighted in red above is a submodel on a "satellite", trained in tandem with 
 Both the larger and the smaller submodel outperform a model trained with the same token-budget/time-budget as each of the models independently.
 The smaller model occupies only ~70% of the VRAM of the larger, and the difference grows with size. These models are of the ~124M parameter range, trained on a small slice of FineWeb.
 
+Here is a little infographic I made about my dreams with `Aftermath`:
+<img width="1215" height="681" alt="image" src="https://github.com/user-attachments/assets/105b1744-e085-4fe5-a34a-47c8fd67bf81" />
+
 
 ## About the code
 Aftermath is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
