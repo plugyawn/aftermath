@@ -1,47 +1,45 @@
 # aftermath
 ## earlier: psyche-elastic
+This is a research fork of Nous Research's [**Psyche**](https://nousresearch.com/nous-psyche/), supported by a very generous compute grant from the same team, and an Emergent Ventures grant.
 
-<p align="center" width="100%">
+<p align="center" width="50%">
 <img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
 </p>
+
 [Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf), and subsequent Gemma-3n models show a way to develop _nested_ Transformers that can be trained collaboratively. 
 
 This means that, even though $A'$ only $\~40$% of the size of the full model $A$ (where $A$ is the full model), it is a good gradient estimator for the full model (over the shared $40$%).
+Note that $A'$ can still operate as a fully independent GPT-class model.
 
 This property can be used to develop a distributed training method that slices GPT models _width-wise_ (in case of FFNs) and _head-wise_ (in case of attention), distribute smaller chunks over devices with less VRAM, while larger devices hold the full model, and intelligently gather gradients. This also produces strong small models that are verifiably more powerful than if they were distilled from the larger model later for an equivalent budget (effectively for free, considering devices with low VRAM can otherwise simply not join the training run). 
 <img width="1018" height="647" alt="image" src="https://github.com/user-attachments/assets/01574699-0f18-4ce7-b41e-bf4f14432529" />
+Highlighted in red above is a submodel on a "satellite", trained in tandem with a larger model.
+Both the larger and the smaller submodel outperform a model trained with the same token-budget/time-budget as each of the models independently.
+The smaller model occupies only ~70% of the VRAM of the larger, and the difference grows with size. These models are of the ~124M parameter range, trained on a small slice of FineWeb.
 
 
+## About the code
+Aftermath is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
+For canonical Psyche documentation, see https://docs.psyche.network (upstream). 
 
-----
-## Blurb
-
-**psyche-elastic** is a fork of [**Psyche**](https://nousresearch.com/nous-psyche/), from Nous Research, focused on elastic, heterogeneous training. 
-The aim is train a `nanoGPT` on a FineWeb subset across the commodity internet, over different devices. 
-Currently, the codebase allows the training of GPT-esque models over a V100 and an A100 in tandem. However, large models that can train on an A100 easily cannot harness the V100. For this, we slice the model into different tiers, as in [Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf). While the original paper describes how to _infer_ different model tiers, the current implementation extends the same to _training_. Coupling this with `psyche`'s Decoupled Momentum optimization, it allows training with steady convergence across different devices that need not have enough memory to hold the entire device, in a way such that each GPU actually has a measurable, positive impact on convergence.
-
-It is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
-
-For canonical Psyche documentation, see https://docs.psyche.network (upstream). This README adds the elastic workflow and fork‑specific details.
+This README adds the elastic workflow and fork‑specific details. For more extensive documentation, please host `psyche-book`, available on this repo, and refer to the new Matformer training details.
 
 ---
+Aftermath offers, out of the box:
 
-- **Heterogeneous training**: smaller devices train smaller tiers; large devices train full tiers; all contribute to shared weights.
-- **Selective downloads**: tiered checkpoints pull only the files needed for a given tier (esp. from HF).
-- **Safe tier mixing**: schema canonicalization + double‑slicing protection prevents mismatched runs.
-- **Operational clarity**: explicit manifests + metadata give reliable tier detection and validation.
+- **Support for Heterogeneous training**:
+  - smaller devices train smaller tiers; large devices train full tiers; all contribute to shared weights.
+  - tiered checkpoints pull only the files needed for a given tier (esp. from HF).
+  - schema canonicalization + double‑slicing protection prevents mismatched runs.
+  - explicit manifests + metadata give reliable tier detection and validation.
 
----
-
-## Matryoshka Transformer
-
+This is possibly through the implementation of a Matryoshka Transformer. Some details, as you look through the code/documentation:
 - Tier slices are **prefixes** of the FFN width: tier 1 = 1/2, tier 2 = 1/4, etc.
 - Clients at smaller tiers update only prefix weights; shared prefixes receive gradients from all tiers.
-- Helper mode (stochastic suffix sampling) is **wired but currently disabled** until sparse alignment/rotation is finalized.
 
 ---
 
-## Quickstart
+## Quickstart Guide
 
 ### Prereqs
 - Rust toolchain
@@ -118,42 +116,16 @@ The loader prevents **double‑slicing** if a checkpoint is already tiered.
 
 ---
 
-## What Changed in This Fork
+## Summary of additions over Psyche
 
-Key contributions:
+[x] MatFormer tier slices, manifests, and hub selective downloads
+[x] Metadata inference + schema canonicalization for mixed tiers
+[x] Heterogeneous gradient aggregation normalization
+[ ] Parameter tying, aggressive NanoGPT support (ongoing)
+[ ] Optimizer and kernel work (Muon, Polar Express) with tests (ongoing)
+[x] System metrics logging + fault injection tools
+[x] Packaging and local testnet improvements
+[ ] **Tensor parallelism with tier > 0** is not supported yet.
+[ ] **Helper mode** (suffix sampling) is disabled until sparse alignment/rotation is complete.
+[ ] Tier export currently assumes a **single `.safetensors` shard**.
 
-- MatFormer tier slices, manifests, and hub selective downloads
-- Metadata inference + schema canonicalization for mixed tiers
-- Helper‑mode infrastructure (temporarily disabled)
-- Heterogeneous gradient aggregation normalization
-- NanoGPT architecture + MatFormer support
-- Optimizer and kernel work (Muon, Polar Express) with tests
-- System metrics logging + fault injection tools
-- Packaging and local testnet improvements
-
----
-
-## Tests
-
-```bash
-source scripts/psyche-env.sh
-cargo test -p psyche-client
-```
-
-(Additional tests live under `shared/` and `psyche-book`.)
-
----
-
-## Notes & Limitations
-
-- **Tensor parallelism with tier > 0** is not supported yet.
-- **Helper mode** (suffix sampling) is disabled until sparse alignment/rotation is complete.
-- Tier export currently assumes a **single `.safetensors` shard**.
-
----
-
-## Upstream
-
-This repo is built on top of the upstream **Psyche** project:
-- Upstream: https://github.com/PsycheFoundation/psyche
-- Docs: https://docs.psyche.network
