@@ -4,6 +4,17 @@
 <p align="center" width="100%">
 <img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
 </p>
+[Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf), and subsequent Gemma-3n models show a way to develop _nested_ Transformers that can be trained collaboratively. 
+
+This means that, even though $A'$ only $\~40$% of the size of the full model $A$ (where $A$ is the full model), it is a good gradient estimator for the full model (over the shared $40$%).
+
+This property can be used to develop a distributed training method that slices GPT models _width-wise_ (in case of FFNs) and _head-wise_ (in case of attention), distribute smaller chunks over devices with less VRAM, while larger devices hold the full model, and intelligently gather gradients. This also produces strong small models that are verifiably more powerful than if they were distilled from the larger model later for an equivalent budget (effectively for free, considering devices with low VRAM can otherwise simply not join the training run). 
+<img width="1018" height="647" alt="image" src="https://github.com/user-attachments/assets/01574699-0f18-4ce7-b41e-bf4f14432529" />
+
+
+
+----
+## Blurb
 
 **psyche-elastic** is a fork of [**Psyche**](https://nousresearch.com/nous-psyche/), from Nous Research, focused on elastic, heterogeneous training. 
 The aim is train a `nanoGPT` on a FineWeb subset across the commodity internet, over different devices. 
