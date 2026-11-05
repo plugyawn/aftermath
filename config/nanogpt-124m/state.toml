@@ -33,14 +33,15 @@ data_location = { Local = "data/fineweb10B" }
 repo_id = "plugyawn/nanogpt-124m-init"
 
 [model.LLM.lr_schedule.Cosine]
-base_lr = 0.008
+base_lr = 4.0e-4
 warmup_steps = 100
 warmup_init_lr = 0.0
 total_steps = 1840
-final_lr = 0.0008
+final_lr = 4.0e-5
 
-[model.LLM.optimizer.AdamW]
-betas = [0.9, 0.95]
-weight_decay = 0.1
-eps = 1.0e-8
+[model.LLM.optimizer.Distro]
 clip_grad_norm = 1.0
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true

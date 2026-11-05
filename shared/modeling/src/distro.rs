@@ -11,7 +11,10 @@ pub(crate) enum PrefixAlignError {
     ShapeMismatch { full: Vec<i64>, grad: Vec<i64> },
 }
 
-fn matformer_prefix_dim(name: &str) -> Option<usize> {
+/// Returns the dimension that holds the FFN width of a MatFormer parameter.
+///
+/// Returns `None` for every parameter that has the same shape on all tiers.
+pub fn matformer_prefix_dim(name: &str) -> Option<usize> {
     if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") {
         Some(0)
     } else if name.ends_with("down_proj.weight") {
@@ -19,6 +22,18 @@ fn matformer_prefix_dim(name: &str) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Returns true when one width is the other width divided by a power of two.
+///
+/// All MatFormer tiers use `intermediate_size / 2^tier`, so a peer width that
+/// fails this check cannot come from a tier of this model.
+pub fn is_matformer_tier_width(a: i64, b: i64) -> bool {
+    if a <= 0 || b <= 0 {
+        return false;
+    }
+    let (wide, narrow) = if a >= b { (a, b) } else { (b, a) };
+    (0..i64::BITS).any(|tier| wide >> tier == narrow)
 }
 
 /// Extract layer index from parameter name like "model.layers.5.mlp.gate_proj.weight"
@@ -152,6 +167,13 @@ fn align_matformer_prefix_grad(
         return Ok(grad);
     }
 
+    if !is_matformer_tier_width(prefix_len, grad_len) {
+        return Err(PrefixAlignError::ShapeMismatch {
+            full: full_shape.to_vec(),
+            grad: grad_shape,
+        });
+    }
+
     if grad_len > prefix_len {
         Ok(grad.narrow(prefix_dim as i64, 0, prefix_len))
     } else {
@@ -160,6 +182,100 @@ fn align_matformer_prefix_grad(
         prefix_view.copy_(&grad);
         Ok(expanded)
     }
+}
+
+/// Checks a received result against the local parameter before any decode.
+///
+/// A result that fails this check would panic in decode or would write to the
+/// wrong coefficients, so `Distro::apply` drops it.
+fn validate_distro_result(
+    name: &str,
+    full_shape: &[i64],
+    result: &DistroResult,
+) -> Result<(), PrefixAlignError> {
+    let rank_error = || PrefixAlignError::RankMismatch {
+        expected: full_shape.len() * 2,
+        got: result.xshape.len(),
+    };
+    if result.xshape.iter().any(|&dim| dim <= 0) {
+        return Err(rank_error());
+    }
+    let (decoded_shape, totalk, batch_dims) = match (result.xshape.as_slice(), full_shape.len()) {
+        (&[y, x, h, w], 2) => (vec![y * h, x * w], h * w, vec![y, x]),
+        (&[x, w], 1) => (vec![x * w], w, vec![x]),
+        _ => return Err(rank_error()),
+    };
+
+    let shape_error = |grad: Vec<i64>| PrefixAlignError::ShapeMismatch {
+        full: full_shape.to_vec(),
+        grad,
+    };
+
+    if decoded_shape != full_shape {
+        let Some(prefix_dim) = matformer_prefix_dim(name) else {
+            return Err(PrefixAlignError::UnsupportedParameter(name.to_string()));
+        };
+        let other_dim = 1 - prefix_dim;
+        if full_shape.len() != 2
+            || decoded_shape[other_dim] != full_shape[other_dim]
+            || !is_matformer_tier_width(full_shape[prefix_dim], decoded_shape[prefix_dim])
+        {
+            return Err(shape_error(decoded_shape));
+        }
+    }
+
+    if result.totalk.abs() != totalk {
+        return Err(shape_error(decoded_shape));
+    }
+
+    // `compress_idx` stores indices as raw bytes, except for very large tensors.
+    let idx_bytes_per_item = match totalk {
+        t if t <= 256 => 1,
+        t if t <= 65536 => 2,
+        t if t <= 4294967296 => 4,
+        _ => 1,
+    };
+    if totalk <= 4294967296 && result.sparse_idx.kind() != Kind::Uint8 {
+        return Err(shape_error(result.sparse_idx.size()));
+    }
+    let idx_size = result.sparse_idx.size();
+    let Some((&idx_last, idx_batch)) = idx_size.split_last() else {
+        return Err(shape_error(idx_size));
+    };
+    let val_size = result.sparse_val.size();
+    let values_match = idx_last > 0
+        && idx_last % idx_bytes_per_item == 0
+        && idx_batch == batch_dims.as_slice()
+        && val_size.split_last().map(|(&last, batch)| {
+            last == idx_last / idx_bytes_per_item && batch == batch_dims.as_slice()
+        }) == Some(true);
+    if !values_match {
+        return Err(shape_error(val_size));
+    }
+
+    let max_idx = decompress_idx(totalk, &result.sparse_idx)
+        .max()
+        .int64_value(&[]);
+    if max_idx >= totalk {
+        return Err(shape_error(vec![max_idx]));
+    }
+    Ok(())
+}
+
+/// Rounds a tensor to the BF16 grid and keeps its kind.
+fn round_to_bf16(tensor: &Tensor) -> Tensor {
+    tensor.to_kind(Kind::BFloat16).to_kind(tensor.kind())
+}
+
+/// Rounds a scalar to the BF16 grid.
+///
+/// BF16 tensor arithmetic rounds a scalar operand first, so this step is
+/// necessary to get the same result in a Float tensor.
+fn round_scalar_to_bf16(value: f64) -> f64 {
+    Tensor::from(value as f32)
+        .to_kind(Kind::BFloat16)
+        .to_kind(Kind::Double)
+        .double_value(&[])
 }
 
 pub struct TransformDCT {
@@ -171,9 +287,11 @@ pub struct TransformDCT {
 impl TransformDCT {
     pub fn new(variables: StableVariableIterator, target_chunk: i64) -> Self {
         let _no_grad = tch::no_grad_guard();
-        let mut shape_dict = HashMap::new();
-        let mut f_dict = HashMap::new();
-        let mut b_dict = HashMap::new();
+        let mut transform = Self {
+            shape_dict: HashMap::new(),
+            f_dict: HashMap::new(),
+            b_dict: HashMap::new(),
+        };
 
         // Get all variants of model tensor sizes
         // Generate all possible valid DCT sizes for model tensors
@@ -181,37 +299,35 @@ impl TransformDCT {
             let size = variable.full_tensor_shape();
             let variable = variable.local_tensor();
             for s in size {
-                // Get the closest smallest divisor to the targeted DCT size
-                let sc = match shape_dict.get(&s) {
-                    Some(sc) => *sc,
-                    None => {
-                        let sc = Self::get_smaller_split(s, target_chunk);
-                        shape_dict.insert(s, sc);
-                        sc
-                    }
-                };
-
-                // Pregenerate DCT basis matrices
-                if let std::collections::hash_map::Entry::Vacant(e) = f_dict.entry(sc) {
-                    let i = Tensor::eye(sc, (Kind::Float, variable.device()));
-                    e.insert(
-                        Self::dct(&i, true)
-                            .to_kind(variable.kind())
-                            .to(variable.device()),
-                    );
-                    b_dict.insert(
-                        sc,
-                        Self::idct(&i, true)
-                            .to_kind(variable.kind())
-                            .to(variable.device()),
-                    );
-                }
+                transform.register_size(s, target_chunk, variable.device(), variable.kind());
             }
         }
-        Self {
-            shape_dict,
-            f_dict,
-            b_dict,
+        transform
+    }
+
+    /// Adds the DCT basis for one tensor dimension.
+    ///
+    /// A client that holds full weights but trains a narrower tier needs this
+    /// for its tier width, because no local variable has that size.
+    pub fn register_size(&mut self, s: i64, target_chunk: i64, device: Device, kind: Kind) {
+        let _no_grad = tch::no_grad_guard();
+        // Get the closest smallest divisor to the targeted DCT size
+        let sc = match self.shape_dict.get(&s) {
+            Some(sc) => *sc,
+            None => {
+                let sc = Self::get_smaller_split(s, target_chunk);
+                self.shape_dict.insert(s, sc);
+                sc
+            }
+        };
+
+        // Pregenerate DCT basis matrices
+        if let std::collections::hash_map::Entry::Vacant(e) = self.f_dict.entry(sc) {
+            let i = Tensor::eye(sc, (Kind::Float, device));
+            e.insert(Self::dct(&i, true).to_kind(kind).to(device));
+            // The decode basis stays in Float. `apply` must decode at the same precision
+            // on all clients, because a rounded basis can flip the sign of a small value.
+            self.b_dict.insert(sc, Self::idct(&i, true).to(device));
         }
     }
 
@@ -444,13 +560,11 @@ impl TransformDCT {
 
             if !self.b_dict.contains_key(&n1) {
                 let i = Tensor::eye(n1, (Kind::Float, device));
-                self.b_dict
-                    .insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict.insert(n1, Self::idct(&i, true));
             }
             if !self.b_dict.contains_key(&n2) {
                 let i = Tensor::eye(n2, (Kind::Float, device));
-                self.b_dict
-                    .insert(n2, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict.insert(n2, Self::idct(&i, true));
             }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             let n2w = self.b_dict.get(&n2).unwrap().to_device(device);
@@ -458,7 +572,7 @@ impl TransformDCT {
             self.b_dict.insert(n1, n1w.copy());
             self.b_dict.insert(n2, n2w.copy());
 
-            let x = Self::einsum_2d_t(x, &n1w, Some(&n2w));
+            let x = Self::einsum_2d_t(x, &n1w.to_kind(x.kind()), Some(&n2w.to_kind(x.kind())));
             let x_shape = x.size();
 
             // Equivalent to rearrange(x, "y h x w -> (y h) (x w)")
@@ -471,13 +585,12 @@ impl TransformDCT {
 
             if !self.b_dict.contains_key(&n1) {
                 let i = Tensor::eye(n1, (Kind::Float, device));
-                self.b_dict
-                    .insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+                self.b_dict.insert(n1, Self::idct(&i, true));
             }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             self.b_dict.insert(n1, n1w.copy());
 
-            let x = Self::einsum_2d_t(x, &n1w, None);
+            let x = Self::einsum_2d_t(x, &n1w.to_kind(x.kind()), None);
             let x_shape = x.size();
 
             // Equivalent to rearrange(x, "x w -> (x w)")
@@ -613,6 +726,9 @@ fn decompress_idx(max_value: i64, idx: &Tensor) -> Tensor {
 
 struct State {
     delta: Box<dyn Variable>,
+    /// Flat indices and earlier values of the elements that rounding stops
+    /// the reverse lookahead step from restoring.
+    lookahead_restore: Option<(Tensor, Tensor)>,
 }
 
 #[derive(Debug)]
@@ -643,6 +759,15 @@ pub struct Distro {
     weight_decay: f64,
     state: Vec<State>,
     transform: TransformDCT,
+    /// FFN width of this client when it holds full weights but trains a narrower tier.
+    ///
+    /// The client sends only this prefix. This gives the same wire format as a
+    /// client with sliced weights, and it never sends the empty tail.
+    active_ffn_width: Option<i64>,
+    /// Keep Float weights on the BF16 grid, so this client tracks BF16 peers.
+    snap_to_bf16: bool,
+    /// Step size of the lookahead that is now in the weights.
+    lookahead_lr: Option<f64>,
 }
 
 impl Distro {
@@ -660,6 +785,7 @@ impl Distro {
         for variable in vs.variables() {
             state.push(State {
                 delta: variable.zeros_like(format!("{}.delta", variable.name())),
+                lookahead_restore: None,
             });
 
             let logical_tensor = variable.logical_tensor();
@@ -667,27 +793,84 @@ impl Distro {
             variable.zero_grad();
         }
 
-        let transform = TransformDCT::new(vs.variables(), compression_chunk);
+        let mut transform = TransformDCT::new(vs.variables(), compression_chunk);
 
-        Self {
+        let active_ffn_width = vs.matformer_active_ffn_width();
+        let first_variable = vs.variables().next().map(|v| v.logical_tensor());
+        if let (Some(width), Some(tensor)) = (active_ffn_width, first_variable.as_ref()) {
+            transform.register_size(width, compression_chunk, tensor.device(), tensor.kind());
+        }
+
+        // MPS keeps weights in Float, and all other devices keep them in BF16.
+        let snap_to_bf16 = first_variable
+            .map(|t| t.device() == Device::Mps && t.kind() == Kind::Float)
+            .unwrap_or(false);
+
+        let distro = Self {
             sgd,
             compression_decay,
             compression_topk,
             weight_decay,
             state,
             transform,
+            active_ffn_width,
+            snap_to_bf16,
+            lookahead_lr: None,
+        };
+        distro.snap_variables(vs);
+        distro
+    }
+
+    fn snap_variables(&self, vars: &dyn CausalLM) {
+        if !self.snap_to_bf16 {
+            return;
         }
+        let _no_grad = tch::no_grad_guard();
+        for var in vars.variables() {
+            let mut variable = var.logical_tensor();
+            let rounded = round_to_bf16(&variable);
+            variable.copy_(&rounded);
+        }
+    }
+
+    fn snap_tensor(&self, tensor: &mut Tensor) {
+        if self.snap_to_bf16 {
+            let rounded = round_to_bf16(tensor);
+            tensor.copy_(&rounded);
+        }
+    }
+
+    /// Returns the lookahead step for one variable, in the precision of the consensus weights.
+    fn lookahead_step(&self, delta: &Tensor, lr: f64) -> Tensor {
+        let step = delta.sign().multiply_scalar(lr);
+        if self.snap_to_bf16 {
+            round_to_bf16(&step)
+        } else {
+            step
+        }
+    }
+
+    /// Fraction of elements that one step of size `lr` leaves unchanged in BF16.
+    fn bf16_lost_update_fraction(variable: &Tensor, lr: f64) -> f64 {
+        let weights = variable.to_kind(Kind::Float);
+        let updated = (&weights - lr).to_kind(Kind::BFloat16).to_kind(Kind::Float);
+        updated
+            .eq_tensor(&round_to_bf16(&weights))
+            .to_kind(Kind::Float)
+            .mean(Kind::Float)
+            .double_value(&[])
     }
 
     pub fn generate(
         &mut self,
         variables: &dyn CausalLM,
         prev_self_results: &[Vec<DistroResult>],
-        prev_lr: f64,
         lr: f64,
         stats: bool,
     ) -> Vec<DistroResult> {
         let _no_grad = tch::no_grad_guard();
+
+        self.undo_lookahead(variables);
 
         let mut ret = Vec::new();
         for (index, var) in variables.variables().enumerate() {
@@ -704,10 +887,10 @@ impl Distro {
                 _ => None,
             };
 
-            let delta_var = &mut self.state.get_mut(index).unwrap().delta;
-            let mut delta = delta_var.logical_tensor();
+            let lost_update_fraction: Option<f64> =
+                stats.then(|| Self::bf16_lost_update_fraction(&variable, lr));
 
-            let _t = variable.g_add_(&delta.sign().multiply_scalar(prev_lr));
+            let mut delta = self.state[index].delta.logical_tensor();
 
             if !prev_self_results.is_empty() {
                 let device = variable.device();
@@ -739,6 +922,13 @@ impl Distro {
                     device,
                 );
                 let transmit_grad = self.transform.decode(&decompressed);
+                // We may send only the tier prefix, and delta always has the full shape.
+                let transmit_grad = align_matformer_prefix_grad(
+                    var.name(),
+                    &var.full_tensor_shape(),
+                    transmit_grad,
+                )
+                .expect("our own DisTrO result must match our own parameter shape");
 
                 // Remove transmitted from delta
                 let _t = delta.g_sub_(&var.shard_other_tensor_like_me(transmit_grad));
@@ -746,7 +936,14 @@ impl Distro {
 
             // weight decay
             if self.weight_decay != 0.0 {
-                let _t = variable.g_mul_scalar_(1.0 - lr * self.weight_decay);
+                let factor = 1.0 - lr * self.weight_decay;
+                let factor = if self.snap_to_bf16 {
+                    round_scalar_to_bf16(factor)
+                } else {
+                    factor
+                };
+                let _t = variable.g_mul_scalar_(factor);
+                self.snap_tensor(&mut variable);
             }
 
             // decay delta
@@ -758,9 +955,19 @@ impl Distro {
             let _t = delta.g_add_(&variable.grad().multiply_scalar(lr));
 
             // Compress delta
-            let full_delta = delta_var.gather_full_tensor();
-            let (sparse_idx, sparse_val, xshape, totalk) =
-                CompressDCT::compress(&self.transform.encode(&full_delta), self.compression_topk);
+            let full_delta = self.state[index].delta.gather_full_tensor();
+            // A narrower tier has no gradient in the tail, so it must not send one:
+            // 1-bit values cannot express zero, and raw zeros dilute full-tier peers.
+            let delta_to_send = match (self.active_ffn_width, matformer_prefix_dim(var.name())) {
+                (Some(width), Some(prefix_dim)) => {
+                    full_delta.narrow(prefix_dim as i64, 0, width).contiguous()
+                }
+                _ => full_delta.shallow_clone(),
+            };
+            let (sparse_idx, sparse_val, xshape, totalk) = CompressDCT::compress(
+                &self.transform.encode(&delta_to_send),
+                self.compression_topk,
+            );
 
             let delta_energy: Option<f64> = match stats {
                 true => Some(
@@ -783,6 +990,10 @@ impl Distro {
                         Some(HashMap::from([
                             (format!("{name}.delta_energy"), delta_energy.unwrap()),
                             (format!("{name}.grad_energy"), grad_energy.unwrap()),
+                            (
+                                format!("{name}.bf16_lost_update_fraction"),
+                                lost_update_fraction.unwrap(),
+                            ),
                         ]))
                     }
                     false => None,
@@ -802,16 +1013,43 @@ impl Distro {
             let variable = var.logical_tensor();
             let device = variable.device();
             let full_shape = var.full_tensor_shape();
-            let indicies = results
-                .iter()
-                .map(|x| x[index].sparse_idx.to_device(device))
-                .collect::<Vec<_>>();
 
-            let val_kind: Kind = variable.kind();
-            let values = results
+            let usable: Vec<&DistroResult> = results
                 .iter()
-                .map(|x| {
-                    let sparse_val = x[index].sparse_val.to_device(device);
+                .map(|peer| &peer[index])
+                .filter(
+                    |result| match validate_distro_result(var.name(), &full_shape, result) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                parameter = var.name(),
+                                full_shape = ?full_shape,
+                                xshape = ?result.xshape,
+                                "Dropping invalid peer result in DisTrO apply: {err:?}"
+                            );
+                            false
+                        }
+                    },
+                )
+                .collect();
+            let Some(first) = usable.first() else {
+                warn!(
+                    parameter = var.name(),
+                    "Skipping DisTrO apply: no compatible grads found"
+                );
+                continue;
+            };
+
+            // All clients decode in Float, so the vote does not depend on the weight kind.
+            let val_kind = Kind::Float;
+            let indicies = usable
+                .iter()
+                .map(|result| result.sparse_idx.to_device(device))
+                .collect::<Vec<_>>();
+            let values = usable
+                .iter()
+                .map(|result| {
+                    let sparse_val = result.sparse_val.to_device(device);
                     if sparse_val.kind() == Kind::Bool {
                         Self::unpack_tensor_sign_from_boolean(sparse_val, val_kind)
                     } else {
@@ -820,109 +1058,113 @@ impl Distro {
                 })
                 .collect::<Vec<_>>();
 
-            let same_shape = results.iter().all(|x| {
-                x[index].xshape == results[0][index].xshape
-                    && x[index].totalk == results[0][index].totalk
-            });
+            let same_shape = usable
+                .iter()
+                .all(|result| result.xshape == first.xshape && result.totalk == first.totalk);
 
-            if same_shape {
+            let aggregated = if same_shape {
                 // Decode grad from all nodes (fast path)
                 let decompressed = CompressDCT::batch_decompress(
                     &indicies,
                     &values,
-                    &results[0][index].xshape,
-                    results[0][index].totalk,
+                    &first.xshape,
+                    first.totalk,
                     val_kind,
                     device,
                 );
-
                 let decoded = self.transform.decode(&decompressed);
-                let aligned = match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
-                    Ok(tensor) => tensor,
-                    Err(err) => {
-                        warn!(
-                            parameter = var.name(),
-                            full_shape = ?full_shape,
-                            "Skipping incompatible grad shape in DisTrO apply: {err:?}"
-                        );
-                        continue;
-                    }
-                };
-
-                // Set the gradients!!!
-                var.set_grad(aligned);
+                align_matformer_prefix_grad(var.name(), &full_shape, decoded)
+                    .expect("validate_distro_result accepted this shape")
             } else {
                 // Heterogeneous shapes: decode individually, then align to local shape.
-                let mut combined: Option<Tensor> = None;
-                let mut contributing_peers: usize = 0;
-                for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
-                    let res = &peer_results[index];
-                    let sparse_idx = res.sparse_idx.to_device(device);
+                // We take only the sign of this sum below, so it needs no peer-count division.
+                let mut combined = Tensor::zeros(&full_shape, (val_kind, device));
+                for ((result, sparse_idx), sparse_val) in
+                    usable.iter().zip(indicies.iter()).zip(values.iter())
+                {
                     let decompressed = CompressDCT::decompress(
-                        &sparse_idx,
+                        sparse_idx,
                         sparse_val,
-                        &res.xshape,
-                        res.totalk,
+                        &result.xshape,
+                        result.totalk,
                         val_kind,
                         device,
                     );
                     let decoded = self.transform.decode(&decompressed);
-                    let aligned =
-                        match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
-                            Ok(tensor) => tensor,
-                            Err(err) => {
-                                warn!(
-                                    parameter = var.name(),
-                                    full_shape = ?full_shape,
-                                    "Skipping incompatible grad shape in DisTrO apply: {err:?}"
-                                );
-                                continue;
-                            }
-                        };
-                    combined = Some(match combined {
-                        Some(acc) => acc + aligned,
-                        None => aligned,
-                    });
-                    contributing_peers += 1;
+                    let aligned = align_matformer_prefix_grad(var.name(), &full_shape, decoded)
+                        .expect("validate_distro_result accepted this shape");
+                    let _t = combined.g_add_(&aligned);
                 }
+                combined
+            };
 
-                if let Some(combined) = combined {
-                    // Normalize by contributing peer count (consistent with "mean" in batch_decompress)
-                    let normalized = if contributing_peers > 1 {
-                        combined / (contributing_peers as f64)
-                    } else {
-                        combined
-                    };
-                    var.set_grad(normalized);
-                } else {
-                    warn!(
-                        parameter = var.name(),
-                        "Skipping DisTrO apply: no compatible grads found"
-                    );
-                    continue;
-                }
-            }
-
-            // Sign-SGD
-            let _t = variable.grad().sign_();
+            // Sign-SGD. We take the sign before the write, because the write can
+            // round a small Float value to zero in a BF16 gradient buffer.
+            var.set_grad(aggregated.sign());
         }
         // SGD step
-        self.sgd.set_learning_rate(lr).unwrap();
+        let effective_lr = if self.snap_to_bf16 {
+            round_scalar_to_bf16(lr)
+        } else {
+            lr
+        };
+        self.sgd.set_learning_rate(effective_lr).unwrap();
         let _ = self.sgd.step();
+        self.snap_variables(vars);
         for var in vars.variables() {
             var.zero_grad();
         }
     }
 
+    /// Moves the weights to the lookahead point for the next forward pass.
+    ///
+    /// Clients have different local errors, so the consensus weights must come back
+    /// exactly. Rounding can stop the reverse step from restoring an element, so
+    /// this function also keeps the earlier values of those elements.
     pub fn error_correction(&mut self, vars: &dyn CausalLM, prev_lr: f64) {
+        let _no_grad = tch::no_grad_guard();
+        self.undo_lookahead(vars);
+        for (index, var) in vars.variables().enumerate() {
+            let mut variable = var.logical_tensor();
+            let before = variable.copy();
+
+            // Apply lookahead, the signed delta, multiplied by lr
+            let step = self.lookahead_step(&self.state[index].delta.logical_tensor(), prev_lr);
+            let _t = variable.g_sub_(&step);
+            self.snap_tensor(&mut variable);
+
+            let mut restored = &variable + &step;
+            self.snap_tensor(&mut restored);
+            let indices = restored
+                .ne_tensor(&before)
+                .flatten(0, -1)
+                .nonzero()
+                .flatten(0, -1);
+            self.state[index].lookahead_restore = (indices.numel() > 0).then(|| {
+                let values = before.flatten(0, -1).index_select(0, &indices);
+                (indices, values)
+            });
+        }
+        self.lookahead_lr = Some(prev_lr);
+    }
+
+    /// Returns the weights to the consensus values.
+    ///
+    /// `generate` calls this function after the backward pass. A step that stops
+    /// before `generate` must call it too, or the lookahead stays in the weights.
+    pub fn undo_lookahead(&mut self, vars: &dyn CausalLM) {
+        let Some(lr) = self.lookahead_lr.take() else {
+            return;
+        };
         let _no_grad = tch::no_grad_guard();
         for (index, var) in vars.variables().enumerate() {
             let mut variable = var.logical_tensor();
-
-            let state = self.state.get_mut(index).unwrap();
-
-            // Apply lookahead, the signed delta, multiplied by lr
-            let _t = variable.g_sub_(&state.delta.logical_tensor().sign().multiply_scalar(prev_lr));
+            let step = self.lookahead_step(&self.state[index].delta.logical_tensor(), lr);
+            let _t = variable.g_add_(&step);
+            self.snap_tensor(&mut variable);
+            if let Some((indices, values)) = self.state[index].lookahead_restore.take() {
+                let _t = variable.flatten(0, -1).index_copy_(0, &indices, &values);
+            }
         }
     }
 
@@ -938,6 +1180,20 @@ impl Distro {
         debug_assert_eq!(tensor.kind(), Kind::Bool);
         debug_assert_eq!(tensor.size(), original_size);
         tensor
+    }
+
+    /// Packs values to 1-bit signs for transmission.
+    ///
+    /// One bit cannot express zero. A fixed sign would give every peer the same
+    /// bias on a coefficient that holds no information, so a zero gets a random sign.
+    pub fn quantize_tensor_to_boolean_sign(tensor: &Tensor) -> Tensor {
+        let signs = Self::quantize_nozeros_tensor_to_boolean_sign(tensor);
+        let zeros = tensor.eq(0.0);
+        if zeros.any().int64_value(&[]) == 0 {
+            return signs;
+        }
+        let random = Tensor::rand(tensor.size(), (Kind::Float, tensor.device())).lt(0.5);
+        random.where_self(&zeros, &signs)
     }
 
     fn unpack_tensor_sign_from_boolean(tensor: Tensor, unpack_kind: Kind) -> Tensor {
@@ -1415,6 +1671,323 @@ mod tests {
         let unquant = Distro::unpack_tensor_sign_from_boolean(quant, input.kind());
 
         assert!(input.sign().equal(&unquant));
+    }
+
+    use crate::{CausalLM, Communicator, EosToks};
+    use std::sync::Arc;
+
+    struct NamedVariable {
+        name: String,
+        tensor: Tensor,
+    }
+
+    impl Variable for NamedVariable {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn local_tensor(&self) -> Tensor {
+            self.tensor.shallow_clone()
+        }
+        fn logical_tensor(&self) -> Tensor {
+            self.tensor.shallow_clone()
+        }
+        fn gather_full_tensor(&self) -> Tensor {
+            self.tensor.shallow_clone()
+        }
+        fn shard_other_tensor_like_me(&self, tensor: Tensor) -> Tensor {
+            tensor
+        }
+        fn full_tensor_shape(&self) -> Vec<i64> {
+            self.tensor.size()
+        }
+        fn is_sharded(&self) -> bool {
+            false
+        }
+        fn zeros_like(&self, name: String) -> Box<dyn Variable> {
+            Box::new(NamedVariable {
+                name,
+                tensor: self.tensor.zeros_like(),
+            })
+        }
+        fn set_grad(&self, tensor: Tensor) {
+            self.tensor.grad().copy_(&tensor);
+        }
+        fn zero_grad(&self) {
+            let mut grad = self.tensor.grad();
+            if grad.defined() {
+                let _ = grad.zero_();
+            }
+        }
+    }
+
+    struct OneTensorModel {
+        name: String,
+        tensor: Tensor,
+    }
+
+    impl OneTensorModel {
+        fn new(name: &str, tensor: Tensor) -> Self {
+            let tensor = tensor.detach().copy().set_requires_grad(true);
+            (tensor.zeros_like() * &tensor).sum(Kind::Float).backward();
+            Self {
+                name: name.to_string(),
+                tensor,
+            }
+        }
+    }
+
+    impl CausalLM for OneTensorModel {
+        fn forward(
+            &self,
+            _x: &Tensor,
+            _labels: Option<&Tensor>,
+            _position_ids: Option<&Tensor>,
+            _sequence_lengths: Option<&Vec<Vec<i32>>>,
+            _num_logits_to_keep: Option<i64>,
+            _loss_scale: Option<f64>,
+        ) -> (Option<Tensor>, Option<Tensor>) {
+            unimplemented!()
+        }
+        fn bos_token_id(&self) -> Option<i64> {
+            None
+        }
+        fn eos_token_ids(&self) -> Option<EosToks> {
+            None
+        }
+        fn device(&self) -> Device {
+            Device::Cpu
+        }
+        fn max_context_length(&self) -> usize {
+            0
+        }
+        fn variables(&self) -> StableVariableIterator {
+            Box::new(std::iter::once(Box::new(NamedVariable {
+                name: self.name.clone(),
+                tensor: self.tensor.shallow_clone(),
+            }) as Box<dyn Variable>))
+        }
+        fn communicator(&self) -> Option<Arc<Communicator>> {
+            None
+        }
+        fn prepare_for_training(&self) {}
+        fn clip_grad_norm(&self, _max_grad_norm: f64) {}
+    }
+
+    const GATE: &str = "model.layers.0.mlp.gate_proj.weight";
+
+    fn peer_result(model: &OneTensorModel) -> DistroResult {
+        let mut distro = Distro::new(model, 0.999, 16, 4, 0.0);
+        let grad = Tensor::randn(model.tensor.size(), (Kind::Float, Device::Cpu));
+        model.tensor.grad().copy_(&grad);
+        distro.generate(model, &[], 1e-3, false).remove(0)
+    }
+
+    #[test]
+    fn test_is_matformer_tier_width() {
+        assert!(is_matformer_tier_width(256, 256));
+        assert!(is_matformer_tier_width(256, 128));
+        assert!(is_matformer_tier_width(128, 256));
+        assert!(is_matformer_tier_width(341, 170));
+        assert!(!is_matformer_tier_width(256, 3));
+        assert!(!is_matformer_tier_width(256, 999));
+        assert!(!is_matformer_tier_width(256, 0));
+        assert!(!is_matformer_tier_width(-256, 128));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_rejects_non_tier_widths() {
+        for rows in [3, 999] {
+            let grad = Tensor::ones([rows, 8], (Kind::Float, Device::Cpu));
+            let err = align_matformer_prefix_grad(GATE, &[256, 8], grad).unwrap_err();
+            assert!(matches!(err, PrefixAlignError::ShapeMismatch { .. }));
+        }
+    }
+
+    #[test]
+    fn test_apply_drops_invalid_results_and_uses_valid_ones() {
+        let initial = Tensor::randn([256, 8], (Kind::Float, Device::Cpu)) * 0.02;
+        let make_model = || OneTensorModel::new(GATE, initial.copy());
+        let good = peer_result(&make_model());
+
+        // Each of these results would panic or corrupt the update without validation.
+        let mut wrong_width = good.clone();
+        wrong_width.xshape[0] = 3;
+        let mut wrong_totalk = good.clone();
+        wrong_totalk.totalk = 7;
+        let mut wrong_values = good.clone();
+        wrong_values.sparse_val = good.sparse_val.narrow(0, 0, 2);
+        let mut index_out_of_range = good.clone();
+        index_out_of_range.sparse_idx = good.sparse_idx.full_like(255);
+
+        for bad in [wrong_width, wrong_totalk, wrong_values, index_out_of_range] {
+            let expected = make_model();
+            let mut distro = Distro::new(&expected, 0.999, 16, 4, 0.0);
+            distro.apply(&expected, &[vec![good.clone()]], 1e-3);
+
+            let actual = make_model();
+            let mut distro = Distro::new(&actual, 0.999, 16, 4, 0.0);
+            distro.apply(&actual, &[vec![good.clone()], vec![bad.clone()]], 1e-3);
+
+            assert!(actual.tensor.detach().equal(&expected.tensor.detach()));
+            assert!(
+                !actual.tensor.detach().equal(&initial),
+                "the valid result must apply"
+            );
+
+            // A bad result alone leaves the weights unchanged.
+            let alone = make_model();
+            let mut distro = Distro::new(&alone, 0.999, 16, 4, 0.0);
+            distro.apply(&alone, &[vec![bad]], 1e-3);
+            assert!(alone.tensor.detach().equal(&initial));
+        }
+    }
+
+    #[test]
+    fn test_1bit_zero_values_have_no_sign_bias() {
+        set_torch_rng_seed();
+        let input = Tensor::randn([20000], (Kind::Float, Device::Cpu));
+        let mut zero_part = input.narrow(0, 0, 10000);
+        let _ = zero_part.zero_();
+
+        let quantized = Distro::quantize_tensor_to_boolean_sign(&input);
+
+        // Nonzero values keep their exact sign.
+        let nonzero_part = input.narrow(0, 10000, 10000);
+        assert!(
+            quantized
+                .narrow(0, 10000, 10000)
+                .equal(&nonzero_part.signbit())
+        );
+
+        let negative_fraction = quantized
+            .narrow(0, 0, 10000)
+            .to_kind(Kind::Float)
+            .mean(Kind::Float)
+            .double_value(&[]);
+        assert!(
+            (negative_fraction - 0.5).abs() < 0.03,
+            "zeros must not have a fixed sign: {negative_fraction}"
+        );
+
+        let no_zeros = input.g_add_scalar(1000.0);
+        assert!(Distro::quantize_tensor_to_boolean_sign(&no_zeros).equal(&no_zeros.signbit()));
+    }
+
+    /// Float weights with the BF16 grid must equal BF16 weights after every operation.
+    #[test]
+    fn test_float_with_bf16_grid_equals_bf16_weights() {
+        let initial = Tensor::randn([128, 16], (Kind::Float, Device::Cpu)) * 0.05;
+
+        for lr in [4e-4, 4e-5] {
+            let float_model = OneTensorModel::new(GATE, initial.to_kind(Kind::Float));
+            let bf16_model = OneTensorModel::new(GATE, initial.to_kind(Kind::BFloat16));
+            let mut float_distro = Distro::new(&float_model, 0.999, 16, 4, 0.0);
+            let mut bf16_distro = Distro::new(&bf16_model, 0.999, 16, 4, 0.0);
+            float_distro.snap_to_bf16 = true;
+            float_distro.snap_variables(&float_model);
+            assert_same_weights(&float_model, &bf16_model, -1, "start");
+
+            for round in 0..200 {
+                let source = OneTensorModel::new(GATE, initial.copy());
+                let mut result = peer_result(&source);
+                result.sparse_val = Distro::quantize_tensor_to_boolean_sign(&result.sparse_val);
+                let results = vec![vec![result]];
+
+                // The same local error term gives the same lookahead on both clients.
+                let sign = (Tensor::rand([128, 16], (Kind::Float, Device::Cpu)) - 0.5).sign();
+                for (distro, kind) in [
+                    (&mut float_distro, Kind::Float),
+                    (&mut bf16_distro, Kind::BFloat16),
+                ] {
+                    let _no_grad = tch::no_grad_guard();
+                    distro.state[0]
+                        .delta
+                        .logical_tensor()
+                        .copy_(&sign.to_kind(kind));
+                }
+
+                float_distro.error_correction(&float_model, lr);
+                bf16_distro.error_correction(&bf16_model, lr);
+                assert_same_weights(&float_model, &bf16_model, round, "lookahead");
+
+                float_distro.undo_lookahead(&float_model);
+                bf16_distro.undo_lookahead(&bf16_model);
+                assert_same_weights(&float_model, &bf16_model, round, "lookahead undo");
+
+                float_distro.apply(&float_model, &results, lr);
+                bf16_distro.apply(&bf16_model, &results, lr);
+                assert_same_weights(&float_model, &bf16_model, round, "apply");
+            }
+        }
+    }
+
+    /// Two clients with different local errors must return to the same weights.
+    #[test]
+    fn test_lookahead_undo_restores_exact_weights() {
+        // Small weights and several step sizes reach every rounding case in BF16.
+        let initial = Tensor::randn([256, 64], (Kind::Float, Device::Cpu)) * 0.02;
+        for kind in [Kind::BFloat16, Kind::Float] {
+            for lr in [1.3e-5, 4e-5, 1.7e-4, 4e-4, 2.9e-3] {
+                let model = OneTensorModel::new(GATE, initial.to_kind(kind));
+                let start = model.tensor.detach().copy();
+                let mut distro = Distro::new(&model, 0.999, 64, 8, 0.0);
+                for _ in 0..50 {
+                    let sign = (Tensor::rand([256, 64], (Kind::Float, Device::Cpu)) - 0.5).sign();
+                    {
+                        let _no_grad = tch::no_grad_guard();
+                        distro.state[0]
+                            .delta
+                            .logical_tensor()
+                            .copy_(&sign.to_kind(kind));
+                    }
+                    distro.error_correction(&model, lr);
+                    assert!(
+                        !model.tensor.detach().equal(&start),
+                        "lookahead must move weights"
+                    );
+                    distro.undo_lookahead(&model);
+                    assert!(
+                        model.tensor.detach().equal(&start),
+                        "kind {kind:?}, lr {lr}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A step that stops early must not leave its lookahead in the weights.
+    #[test]
+    fn test_second_lookahead_does_not_stack_on_a_cancelled_step() {
+        let initial = Tensor::randn([64, 16], (Kind::Float, Device::Cpu)) * 0.02;
+        let model = OneTensorModel::new(GATE, initial.to_kind(Kind::BFloat16));
+        let start = model.tensor.detach().copy();
+        let mut distro = Distro::new(&model, 0.999, 16, 4, 0.0);
+        let sign = (Tensor::rand([64, 16], (Kind::Float, Device::Cpu)) - 0.5).sign();
+        {
+            let _no_grad = tch::no_grad_guard();
+            distro.state[0]
+                .delta
+                .logical_tensor()
+                .copy_(&sign.to_kind(Kind::BFloat16));
+        }
+        distro.error_correction(&model, 4e-4);
+        let once = model.tensor.detach().copy();
+        distro.error_correction(&model, 4e-4);
+        assert!(model.tensor.detach().equal(&once));
+        distro.undo_lookahead(&model);
+        distro.undo_lookahead(&model);
+        assert!(model.tensor.detach().equal(&start));
+    }
+
+    fn assert_same_weights(a: &OneTensorModel, b: &OneTensorModel, round: i64, stage: &str) {
+        let a = a.tensor.detach().to_kind(Kind::Float);
+        let b = b.tensor.detach().to_kind(Kind::Float);
+        let differing = a
+            .ne_tensor(&b)
+            .to_kind(Kind::Float)
+            .mean(Kind::Float)
+            .double_value(&[]);
+        assert_eq!(differing, 0.0, "round {round}, after {stage}");
     }
 
     #[test]

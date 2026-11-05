@@ -612,7 +612,17 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
             return;
         };
 
-        // TODO: verify shape of distro_results
+        // The coordinator does not check the model schema on every backend, so we check it here.
+        // `Distro::apply` checks the shape of each result.
+        if distro_result.schema_hash != self.training.schema_hash {
+            warn!(
+                from = %from,
+                batch_id = %batch_id,
+                "Ignoring distro result: peer has a different model schema"
+            );
+            return;
+        }
+
         let commitment = commitment.1.0;
         let batch_ids_not_yet_trained_on = round_state.batch_ids_not_yet_trained_on.clone();
         let blooms = round_state.blooms.clone();

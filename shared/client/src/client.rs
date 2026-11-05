@@ -13,8 +13,8 @@ use psyche_metrics::{ClientMetrics, ClientRoleInRound, PeerConnection};
 use psyche_network::{
     AuthenticatableIdentity, BlobTicket, DownloadComplete, DownloadRetryInfo, DownloadType,
     EndpointId, MAX_DOWNLOAD_RETRIES, ModelRequestType, NetworkEvent, NetworkTUIState,
-    PeerManagerHandle, RetriedDownloadsHandle, SharableModel, TransmittableDownload, allowlist,
-    blob_ticket_param_request_task, raw_p2p_verify,
+    PeerManagerHandle, RetriedDownloadsHandle, SharableModel, SharableModelError,
+    TransmittableDownload, allowlist, blob_ticket_param_request_task, raw_p2p_verify,
 };
 use psyche_watcher::{Backend, BackendWatcher};
 use tokenizers::Tokenizer;
@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 use iroh_blobs::api::Tag;
 use rand::{Rng, RngCore, seq::SliceRandom};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     marker::PhantomData,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -106,6 +106,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                     init_config.max_concurrent_parameter_requests;
 
                 let mut current_downloaded_parameters = 0_u64;
+                let mut unusable_parameter_rejections: HashMap<String, u32> = HashMap::new();
                 let mut total_parameters = None;
 
                 let mut run = RunManager::<T, A>::new(RunInitConfigAndIO {
@@ -289,17 +290,54 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                                 run.apply_distro_result(hash, distro_result, None);
                                             },
                                             TransmittableDownload::ModelParameter(parameter) => {
-                                                current_downloaded_parameters += 1;
                                                 info!("Download complete: parameter {}", parameter.name()?);
-                                                if let Some(total_parameters) = total_parameters {
-                                                    info!("Downloaded parameters total: {}/{}", current_downloaded_parameters, total_parameters);
-                                                    metrics.update_model_sharing_total_params_downloaded(current_downloaded_parameters);
-                                                } else {
-                                                    error!("Total parameters not set");
-                                                }
-                                                sharable_model.add_parameter(parameter).await?;
-                                                if sharable_model.is_download_complete() {
-                                                    sharable_model.send_init_parameters()?;
+                                                match sharable_model.add_parameter(parameter).await {
+                                                    Ok(()) => {
+                                                        current_downloaded_parameters += 1;
+                                                        if let Some(total_parameters) = total_parameters {
+                                                            info!("Downloaded parameters total: {}/{}", current_downloaded_parameters, total_parameters);
+                                                            metrics.update_model_sharing_total_params_downloaded(current_downloaded_parameters);
+                                                        } else {
+                                                            error!("Total parameters not set");
+                                                        }
+                                                        if sharable_model.is_download_complete() {
+                                                            sharable_model.send_init_parameters()?;
+                                                        }
+                                                    }
+                                                    // This peer is on a narrower MatFormer tier. Ask another peer.
+                                                    Err(SharableModelError::UnusableParameter { parameter, shape, required }) => {
+                                                        let rejections = unusable_parameter_rejections.entry(parameter.clone()).or_insert(0);
+                                                        *rejections += 1;
+                                                        if *rejections > MAX_UNUSABLE_PARAMETER_REJECTIONS {
+                                                            bail!(
+                                                                "No peer provides {parameter} with FFN width {required}. \
+                                                                 This run may have only narrower MatFormer tiers now. \
+                                                                 Join with a higher --matformer-tier, or load a full checkpoint."
+                                                            );
+                                                        }
+                                                        warn!(
+                                                            parameter = %parameter,
+                                                            shape = ?shape,
+                                                            required,
+                                                            peer = %from.fmt_short(),
+                                                            "Peer has an unusable FFN width for this client; asking another peer"
+                                                        );
+                                                        peer_manager.report_blob_ticket_request_error(from, None);
+                                                        let router = p2p.router().clone();
+                                                        let peer_manager = peer_manager.clone();
+                                                        let tx_params_download = tx_params_download.clone();
+                                                        let param_requests_cancel_token = param_requests_cancel_token.clone();
+                                                        tokio::spawn(async move {
+                                                            let request = ModelRequestType::Parameter(parameter);
+                                                            match get_blob_ticket_to_download(router, request.clone(), peer_manager, param_requests_cancel_token).await {
+                                                                Ok(ticket) => {
+                                                                    let _ = tx_params_download.send(vec![(ticket, request)]);
+                                                                }
+                                                                Err(err) => error!("Could not ask another peer for {request:?}: {err}"),
+                                                            }
+                                                        });
+                                                    }
+                                                    Err(err) => return Err(err.into()),
                                                 }
                                             },
                                             TransmittableDownload::ModelConfig(config) => {
@@ -552,10 +590,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                             let tokenizer: Tokenizer = serde_json::from_str(&tokenizer_string)?;
                             sharable_model.update_config(config_string, tokenizer)?;
                         }
-                        Some((param_names, tx_params_response)) = rx_parameters_req.recv() => {
+                        Some((param_names, required_ffn_width, tx_params_response)) = rx_parameters_req.recv() => {
                             metrics.initialize_model_parameters_gauge(param_names.len().try_into().unwrap());
                             total_parameters = Some(param_names.len());
-                            sharable_model.initialize_parameters(&param_names, tx_params_response);
+                            sharable_model.initialize_parameters(&param_names, required_ffn_width, tx_params_response);
 
                             let tx_params_download = tx_params_download.clone();
                             let router = p2p.router();
@@ -852,6 +890,9 @@ fn all_endpoint_ids_shuffled<T: NodeIdentity>(state: &Coordinator<T>) -> Vec<End
     addrs.shuffle(&mut rand::rng());
     addrs
 }
+
+/// Limit for downloads of one parameter from peers on a narrower MatFormer tier.
+const MAX_UNUSABLE_PARAMETER_REJECTIONS: u32 = 32;
 
 async fn get_blob_ticket_to_download(
     router: Arc<Router>,

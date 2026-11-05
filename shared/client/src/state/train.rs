@@ -103,6 +103,7 @@ pub struct TrainingStepMetadata<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub tx_distro_result: mpsc::UnboundedSender<DistroBroadcastAndPayload>,
 
     pub parameter_names: Arc<Vec<String>>,
+    pub schema_hash: [u8; 32],
     pub matformer_tier: u8,
 
     pub write_gradients_dir: Option<PathBuf>,
@@ -189,6 +190,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
         }
 
         let parameter_names = self.parameter_names.clone();
+        let schema_hash = self.schema_hash;
 
         let applying = self.apply_results(trainers, state, previous_round, current_round)?;
 
@@ -443,6 +445,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 let write_gradients_dir = write_gradients_dir.clone();
                                 let tx_distro_result = tx_distro_result.clone();
                                 let parameter_names = parameter_names.clone();
+                                let schema_hash = schema_hash;
                                 let res: Result<(), TrainError> = tokio::task::spawn_blocking(move || {
                                     if cancelled {
                                         trace!("However, we were cancelled, so we're throwing away this result.");
@@ -462,6 +465,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                     let transmittable_distro_result = TransmittableDistroResult {
                                         step,
                                         batch_id,
+                                        schema_hash,
                                         distro_results: to_transmit
                                             .into_iter()
                                             .zip(parameter_names.iter())

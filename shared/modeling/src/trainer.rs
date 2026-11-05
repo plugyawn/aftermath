@@ -390,7 +390,7 @@ impl Trainer {
             .iter()
             .map(|x| DistroResult {
                 sparse_idx: x.sparse_idx.copy(),
-                sparse_val: Distro::quantize_nozeros_tensor_to_boolean_sign(&x.sparse_val),
+                sparse_val: Distro::quantize_tensor_to_boolean_sign(&x.sparse_val),
                 xshape: x.xshape.clone(),
                 totalk: x.totalk,
                 stats: x.stats.clone(),
@@ -1021,7 +1021,6 @@ impl LocalTrainer {
                                     let ret = optimizer.generate(
                                         model.as_ref(),
                                         &prev_self_distro_results.unwrap_or_default(),
-                                        prev_lr,
                                         lr,
                                         optim_stats_every_n_steps
                                             .map(|stats| step % stats == 0)
@@ -1041,6 +1040,12 @@ impl LocalTrainer {
                         },
                         true => None,
                     };
+                    // A cancelled step never reaches `generate`, so its lookahead is still in the weights.
+                    if cancelled {
+                        if let Optimizer::Distro { optimizer, .. } = &mut optimizer {
+                            optimizer.undo_lookahead(model.as_ref());
+                        }
+                    }
                     // with Python FSDP we need to do a full forward/backward correctly before we can do inference
                     can_do_inference.store(true, Ordering::Relaxed);
                     if submission

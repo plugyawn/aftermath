@@ -308,6 +308,14 @@ impl ModelConfig for NanoGPTConfig {
 }
 
 impl LanguageModelConfig for NanoGPTConfig {
+    fn matformer_active_ffn_width(&self) -> Option<i64> {
+        if self.matformer_tier == 0 {
+            return None;
+        }
+        let divisor = 1_i64.checked_shl(self.matformer_tier as u32)?;
+        Some(self.intermediate_size as i64 / divisor)
+    }
+
     fn tie_word_embeddings(&self) -> bool {
         self.tie_word_embeddings
     }

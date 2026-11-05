@@ -47,6 +47,18 @@ pub struct MatformerCheckpointInfo {
     pub effective_tier: u8,
     /// The base intermediate size before any tier slicing.
     pub base_intermediate_size: Option<u64>,
+    /// False when this client holds only the prefix of the FFN weights.
+    pub holds_full_ffn_weights: bool,
+}
+
+impl MatformerCheckpointInfo {
+    /// The coordinator keeps the last announced checkpoint for all later joins.
+    ///
+    /// A client with sliced weights has no FFN tail, so its upload would delete
+    /// the tail from the run. It can save locally, but it must not publish.
+    pub fn may_publish_checkpoint(&self) -> bool {
+        self.holds_full_ffn_weights
+    }
 }
 
 pub struct CooldownStepMetadata {
@@ -241,6 +253,17 @@ impl CooldownStepMetadata {
                         local.push(to);
                     }
 
+                    let hub_upload = if matformer_info.may_publish_checkpoint() {
+                        hub_upload
+                    } else {
+                        if hub_upload.is_some() {
+                            warn!(
+                                effective_tier = matformer_info.effective_tier,
+                                "This client holds sliced MatFormer weights, so it will not upload this checkpoint"
+                            );
+                        }
+                        None
+                    };
                     let Some(HubUploadInfo {
                         hub_repo,
                         hub_token,
@@ -350,5 +373,24 @@ impl CooldownStep {
             .map_err(|_| CooldownError::CheckpointThreadCrashed)??;
 
         Ok((running_evals, upload_handle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MatformerCheckpointInfo;
+
+    fn info(holds_full_ffn_weights: bool) -> MatformerCheckpointInfo {
+        MatformerCheckpointInfo {
+            effective_tier: 0,
+            base_intermediate_size: Some(1024),
+            holds_full_ffn_weights,
+        }
+    }
+
+    #[test]
+    fn only_a_client_with_full_weights_can_publish_a_checkpoint() {
+        assert!(info(true).may_publish_checkpoint());
+        assert!(!info(false).may_publish_checkpoint());
     }
 }

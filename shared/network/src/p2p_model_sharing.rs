@@ -4,6 +4,7 @@ use iroh::protocol::AcceptError;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler};
 use iroh_blobs::api::Tag;
 use iroh_blobs::ticket::BlobTicket;
+use psyche_modeling::{is_matformer_tier_width, matformer_prefix_dim};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::{Cursor, Write};
@@ -203,6 +204,14 @@ pub const MODEL_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Error, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SharableModelError {
+    #[error(
+        "Parameter {parameter} has shape {shape:?}, but this client needs FFN width {required}"
+    )]
+    UnusableParameter {
+        parameter: String,
+        shape: Vec<i64>,
+        required: i64,
+    },
     #[error("Torch serialize error: {0}")]
     TchSerializeError(String),
     #[error("The update of the sharable model parameters is invalid")]
@@ -329,6 +338,8 @@ pub struct SharableModel {
     config_and_tokenizer_ticket: Option<BlobTicket>,
     pub tx_model_config_response: Option<oneshot::Sender<(String, Tokenizer)>>,
     tx_params_response: Option<oneshot::Sender<HashMap<String, Tensor>>>,
+    /// FFN width that a joining client needs in the tensors that it downloads.
+    required_ffn_width: Option<i64>,
 }
 
 // These impls are methods called by both the sharing model peers and the ones
@@ -344,6 +355,7 @@ impl SharableModel {
             tokenizer_config: None,
             config_and_tokenizer_ticket: None,
             tx_model_config_response: None,
+            required_ffn_width: None,
         }
     }
 }
@@ -493,6 +505,37 @@ impl SharableModel {
     }
 }
 
+/// Makes a downloaded tensor fit the FFN width of this client.
+///
+/// Peers on other MatFormer tiers hold different widths. A wider tensor holds the
+/// prefix that we need. A narrower tensor cannot help, and we must ask another peer.
+fn fit_parameter_to_ffn_width(
+    param_name: &str,
+    tensor: Tensor,
+    required_ffn_width: Option<i64>,
+) -> Result<Tensor, SharableModelError> {
+    let (Some(required), Some(dim)) = (required_ffn_width, matformer_prefix_dim(param_name)) else {
+        return Ok(tensor);
+    };
+    let shape = tensor.size();
+    // MatFormer FFN weights always have rank 2. The model load rejects any other shape.
+    if shape.len() != 2 {
+        return Ok(tensor);
+    }
+    let got = shape[dim];
+    if got == required {
+        return Ok(tensor);
+    }
+    if got < required || !is_matformer_tier_width(got, required) {
+        return Err(SharableModelError::UnusableParameter {
+            parameter: param_name.to_string(),
+            shape,
+            required,
+        });
+    }
+    Ok(tensor.narrow(dim as i64, 0, required).copy())
+}
+
 // These impls on the `SharableModel` struct are the ones called by the
 // new peers that are joining a run and have to download parameters from peers
 // that are sharing them.
@@ -502,8 +545,10 @@ impl SharableModel {
     pub fn initialize_parameters(
         &mut self,
         param_names: &[String],
+        required_ffn_width: Option<i64>,
         tx_params_response: oneshot::Sender<HashMap<String, Tensor>>,
     ) {
+        self.required_ffn_width = required_ffn_width;
         // Initialize the model parameter names with None.
         let mut parameters = HashMap::new();
         for param_name in param_names {
@@ -530,6 +575,8 @@ impl SharableModel {
             .await
             .map_err(|_| SharableModelError::LoadThreadCrashed)??;
         trace!("Finished loading parameter {param_name}");
+        let param_value =
+            fit_parameter_to_ffn_width(&param_name, param_value, self.required_ffn_width)?;
 
         // Validate that the parameter does not already exist
         // This should be called only by a client that joins the run
@@ -691,5 +738,71 @@ impl ProtocolHandler for ModelSharing {
                 let io_error = std::io::Error::other(e.to_string());
                 AcceptError::from_err(io_error)
             })
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+    use tch::{Device, Kind};
+
+    const GATE: &str = "model.layers.0.mlp.gate_proj.weight";
+    const DOWN: &str = "model.layers.0.mlp.down_proj.weight";
+
+    fn ramp(shape: [i64; 2]) -> Tensor {
+        Tensor::arange(shape[0] * shape[1], (Kind::Float, Device::Cpu)).view(shape)
+    }
+
+    #[test]
+    fn wider_tensor_is_narrowed_to_the_prefix() {
+        let wide = ramp([8, 4]);
+        let fitted = fit_parameter_to_ffn_width(GATE, wide.copy(), Some(4)).unwrap();
+        assert!(fitted.equal(&wide.narrow(0, 0, 4)));
+
+        let wide = ramp([4, 8]);
+        let fitted = fit_parameter_to_ffn_width(DOWN, wide.copy(), Some(4)).unwrap();
+        assert!(fitted.equal(&wide.narrow(1, 0, 4)));
+    }
+
+    #[test]
+    fn narrower_tensor_is_rejected() {
+        let err = fit_parameter_to_ffn_width(GATE, ramp([4, 4]), Some(8)).unwrap_err();
+        assert!(matches!(
+            err,
+            SharableModelError::UnusableParameter { required: 8, .. }
+        ));
+    }
+
+    #[test]
+    fn width_from_no_tier_is_rejected() {
+        let err = fit_parameter_to_ffn_width(GATE, ramp([7, 4]), Some(4)).unwrap_err();
+        assert!(matches!(err, SharableModelError::UnusableParameter { .. }));
+    }
+
+    #[test]
+    fn other_parameters_and_unset_requirements_pass_through() {
+        let attention = "model.layers.0.self_attn.q_proj.weight";
+        assert!(fit_parameter_to_ffn_width(attention, ramp([4, 4]), Some(8)).is_ok());
+        assert!(fit_parameter_to_ffn_width(GATE, ramp([4, 4]), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_parameter_stays_pending_until_a_usable_peer_answers() {
+        let (tx, _rx) = oneshot::channel();
+        let mut model = SharableModel::empty();
+        model.initialize_parameters(&[GATE.to_string()], Some(8), tx);
+
+        let parameter = |shape: [i64; 2]| {
+            let mut bytes = Vec::new();
+            ramp(shape).save_to_stream(&mut bytes).unwrap();
+            TransmittableModelParameter::new(GATE.as_bytes().to_vec(), bytes)
+        };
+
+        let err = model.add_parameter(parameter([4, 4])).await.unwrap_err();
+        assert!(matches!(err, SharableModelError::UnusableParameter { .. }));
+        assert!(!model.is_download_complete());
+
+        model.add_parameter(parameter([16, 4])).await.unwrap();
+        assert!(model.is_download_complete());
     }
 }

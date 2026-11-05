@@ -1,8 +1,9 @@
 use crate::{
     IntegrationTestLogMarker, WandBInfo, fetch_data::DataFetcher,
     matformer::{
-        MATFORMER_MANIFEST_NAME, MatformerManifest, ensure_matformer_checkpoint_metadata,
-        infer_matformer_checkpoint_metadata,
+        MATFORMER_MANIFEST_NAME, MatformerManifest, P2pLoadPlan,
+        ensure_matformer_checkpoint_metadata, file_sha256_hex, infer_matformer_checkpoint_metadata,
+        plan_p2p_load,
     },
 };
 use crate::cli::MatformerLoadStrategy;
@@ -10,7 +11,9 @@ use psyche_coordinator::{
     Coordinator, HealthChecks,
     model::{self, HttpLLMTrainingDataLocation, LLMTrainingDataLocation},
 };
-use psyche_core::{Barrier, CancellableBarrier, NodeIdentity, Shuffle, TokenSize, sha256};
+use psyche_core::{
+    Barrier, CancellableBarrier, NodeIdentity, OptimizerDefinition, Shuffle, TokenSize, sha256,
+};
 use psyche_data_provider::{
     DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
     PreprocessedDataProvider, Split, WeightedDataProvider, download_dataset_repo_async,
@@ -339,6 +342,70 @@ mod tests {
         assert_eq!(hash_full, hash_slice);
     }
 
+    /// A client that joins over P2P must get the same canonical schema as the first
+    /// clients, and it must not depend on the tier of the peer that answers.
+    #[test]
+    fn test_canonical_schema_hash_is_stable_across_p2p_joins() {
+        let parameter_names = vec!["model.layers.0.mlp.gate_proj.weight".to_string()];
+        let hub_config = json!({
+            "intermediate_size": 256,
+            "hidden_size": 64,
+            "field_that_the_rust_config_ignores": "kept",
+        });
+        let hash = |config: serde_json::Value, tier: u8, sliced: bool| {
+            schema_hash_for_config(
+                model::LLMArchitecture::HfLlama,
+                &canonicalize_config_for_schema(config, tier, sliced),
+                &parameter_names,
+            )
+        };
+        let expected = hash(hub_config.clone(), 0, false);
+
+        let sliced_peer = plan_p2p_load(hub_config.clone(), 1, false).unwrap();
+        assert_eq!(hash(sliced_peer.config.clone(), 1, true), expected);
+
+        for peer_config in [hub_config, sliced_peer.config] {
+            for (tier, universal) in [(0, false), (1, false), (2, false), (1, true)] {
+                let plan = plan_p2p_load(peer_config.clone(), tier, universal).unwrap();
+                assert_eq!(
+                    hash(plan.config, tier, plan.uses_sliced_checkpoint),
+                    expected,
+                    "tier {tier}, universal {universal}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_manifest_hash_check_rejects_a_changed_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "matformer-hash-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model.safetensors");
+        std::fs::write(&file, b"weights").unwrap();
+        let good = file_sha256_hex(&file).unwrap();
+
+        verify_manifest_file_hashes(vec![(file.clone(), good.clone())])
+            .await
+            .unwrap();
+        verify_manifest_file_hashes(vec![(file.clone(), good.to_uppercase())])
+            .await
+            .unwrap();
+
+        std::fs::write(&file, b"other weights").unwrap();
+        let err = verify_manifest_file_hashes(vec![(file.clone(), good)])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            InitRunError::MatformerManifestHashMismatch { .. }
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_normalize_manifest_paths_for_repo() {
         let selection = ManifestSelection {
@@ -556,6 +623,34 @@ struct ResolvedRepoFiles {
     sliced_checkpoint_tier: Option<u8>,
 }
 
+/// Compares files with the SHA-256 values in the manifest.
+///
+/// A manifest with no value for a file does not check that file.
+async fn verify_manifest_file_hashes(files: Vec<(PathBuf, String)>) -> Result<(), InitRunError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    info!(
+        "Checking SHA-256 of {} MatFormer checkpoint files",
+        files.len()
+    );
+    tokio::task::spawn_blocking(move || {
+        for (path, expected) in files {
+            let actual = file_sha256_hex(&path)?;
+            if !actual.eq_ignore_ascii_case(&expected) {
+                return Err(InitRunError::MatformerManifestHashMismatch {
+                    path: path.to_string_lossy().to_string(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(InitRunError::ModelLoadingThreadCrashed)?
+}
+
 fn ensure_manifest_supported(manifest: &MatformerManifest) -> Result<(), InitRunError> {
     if manifest.schema_version != 1 {
         return Err(InitRunError::UnsupportedMatformerManifestVersion {
@@ -734,6 +829,20 @@ async fn resolve_matformer_local_repo_files(
                     let (repo_files, missing) =
                         resolve_manifest_local_paths(base, &selection.files);
                     if missing.is_empty() {
+                        verify_manifest_file_hashes(
+                            selection
+                                .files
+                                .iter()
+                                .zip(repo_files.iter())
+                                .filter_map(|(name, path)| {
+                                    manifest
+                                        .sha256
+                                        .get(name)
+                                        .map(|hash| (path.clone(), hash.clone()))
+                                })
+                                .collect(),
+                        )
+                        .await?;
                         let config_path = base.join(Path::new(&selection.config_path));
                         let checkpoint_path = config_path
                             .parent()
@@ -908,6 +1017,22 @@ async fn resolve_matformer_hub_repo_files(
         }
     };
 
+    // Manifest hash keys are relative to the manifest, and repo paths are not.
+    let manifest_dir = Path::new(&manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let expected_hashes: Vec<(String, String)> = selection
+        .files
+        .iter()
+        .filter_map(|name| {
+            let hash = manifest.sha256.get(name)?;
+            let combined = manifest_dir.join(name.trim_start_matches("./"));
+            let normalized = normalize_repo_relative_path(&combined, name).ok()?;
+            Some((repo_path_to_string(&normalized), hash.clone()))
+        })
+        .collect();
+
     let selection = match normalize_manifest_selection_for_repo(&manifest_path, selection) {
         Ok(selection) => selection,
         Err(err) => {
@@ -969,6 +1094,16 @@ async fn resolve_matformer_hub_repo_files(
         Some(hub_max_concurrent_downloads),
         false,
         &selection.files,
+    )
+    .await?;
+    verify_manifest_file_hashes(
+        expected_hashes
+            .into_iter()
+            .filter_map(|(name, hash)| {
+                let path = repo_files.iter().find(|path| path.ends_with(&name))?;
+                Some((path.clone(), hash))
+            })
+            .collect(),
     )
     .await?;
     let checkpoint_path = Path::new(&selection.config_path)
@@ -1214,6 +1349,16 @@ pub enum InitRunError {
     #[error("MatFormer manifest referenced missing files: {missing:?}")]
     MissingMatformerManifestFiles { missing: Vec<String> },
 
+    #[error("SHA-256 of {path} is {actual}, but the MatFormer manifest says {expected}")]
+    MatformerManifestHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("MatFormer tier {tier} leaves no FFN neurons in the model from the peer")]
+    InvalidMatformerTierForPeerConfig { tier: u8 },
+
     #[error("Multiple MatFormer manifests found: {paths:?}")]
     MultipleMatformerManifests { paths: Vec<String> },
 }
@@ -1234,6 +1379,8 @@ struct RawLoadedModel {
     parameter_names: Arc<Vec<String>>,
     matformer_effective_tier: u8,
     matformer_base_intermediate_size: Option<u64>,
+    matformer_holds_full_ffn_weights: bool,
+    schema_hash_canonical: [u8; 32],
 }
 
 type OneshotModelParameterSender = oneshot::Sender<HashMap<String, Tensor>>;
@@ -1247,7 +1394,7 @@ pub struct RunInitConfigAndIO<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub tx_checkpoint: UnboundedSender<model::HubRepo>,
     pub tx_schema: UnboundedSender<ModelSchemaInfo>,
     pub tx_model: UnboundedSender<HashMap<String, Tensor>>,
-    pub tx_parameters_req: UnboundedSender<(Vec<String>, OneshotModelParameterSender)>,
+    pub tx_parameters_req: UnboundedSender<(Vec<String>, Option<i64>, OneshotModelParameterSender)>,
     pub tx_config: UnboundedSender<(String, String)>,
     pub tx_distro_result: UnboundedSender<DistroBroadcastAndPayload>,
     pub tx_request_download: UnboundedSender<(BlobTicket, Tag)>,
@@ -1259,6 +1406,9 @@ pub struct RunInitConfigAndIO<T: NodeIdentity, A: AuthenticatableIdentity> {
 
 struct LoadedCheckpoint {
     source: PretrainedSource<AutoConfig>,
+    /// Full config JSON from a peer. The parsed config drops fields that it does not
+    /// know, and the schema hash must see the same fields on all clients.
+    peer_config_json: Option<serde_json::Value>,
     tokenizer: Arc<Tokenizer>,
     checkpoint_extra_files: Vec<PathBuf>,
     uses_sliced_checkpoint: bool,
@@ -1300,6 +1450,15 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
         }
 
         let model::Model::LLM(llm) = state.model;
+
+        if matches!(llm.optimizer, OptimizerDefinition::AdamW { .. })
+            && state.config.min_clients > 1
+        {
+            warn!(
+                "This run uses AdamW with min_clients > 1. AdamW clients do not exchange gradients, \
+                 so each client trains alone. Use the Distro optimizer for shared training."
+            );
+        }
 
         let hub_read_token = init_config.hub_read_token.clone();
         let hub_max_concurrent_downloads = init_config.hub_max_concurrent_downloads;
@@ -1415,6 +1574,19 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     parameter_names.sort();
                     let parameter_names = Arc::new(parameter_names);
 
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    let config = PretrainedSource::ConfigAndTensors(
+                        AutoConfig::Llama(LlamaConfig::dummy()),
+                        Arc::new(psyche_modeling::get_dummy_parameters()),
+                    )
+                    .serialize_config()?;
+                    // A client that joins later gets this config over P2P and must compute the same hash.
+                    let schema_hash_canonical = schema_hash_for_config(
+                        llm.architecture,
+                        &canonicalize_config_for_schema(serde_json::from_str(&config)?, 0, false),
+                        &parameter_names,
+                    );
+
                     let model = RawLoadedModel {
                         models: RawLoadedModelType::ParallelNativeModels(
                             (0..(init_config.data_parallelism * init_config.tensor_parallelism))
@@ -1442,16 +1614,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         parameter_names: parameter_names.clone(),
                         matformer_effective_tier: 0,
                         matformer_base_intermediate_size: None,
+                        matformer_holds_full_ffn_weights: true,
+                        schema_hash_canonical,
                     };
-                    #[allow(clippy::arc_with_non_send_sync)]
-                    let config = &PretrainedSource::ConfigAndTensors(
-                        AutoConfig::Llama(LlamaConfig::dummy()),
-                        Arc::new(psyche_modeling::get_dummy_parameters()),
-                    )
-                    .serialize_config()?;
                     let tokenizer = tokenizer.to_string(false).unwrap();
                     info!("Config Uploaded: {}", config);
-                    tx_config.send((config.to_string(), tokenizer)).unwrap();
+                    tx_config.send((config, tokenizer)).unwrap();
                     Ok(model)
                 }),
                 model::Checkpoint::Hub(_) | model::Checkpoint::P2P(_) => tokio::spawn(async move {
@@ -1497,6 +1665,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             let tokenizer = Arc::new(auto_tokenizer(&repo_files)?);
                             LoadedCheckpoint {
                                 source: PretrainedSource::<AutoConfig>::RepoFiles(repo_files),
+                                peer_config_json: None,
                                 tokenizer,
                                 checkpoint_extra_files,
                                 uses_sliced_checkpoint: sliced_checkpoint,
@@ -1518,6 +1687,27 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             let (model_config, tokenizer) =
                                 rx_model_config_response.await.unwrap();
                             debug!("Got p2p info, model_config: {}", model_config);
+
+                            let peer_config: serde_json::Value =
+                                serde_json::from_str(&model_config)?;
+                            let plan = match llm.architecture {
+                                model::LLMArchitecture::HfLlama
+                                | model::LLMArchitecture::HfNanoGPT => plan_p2p_load(
+                                    peer_config,
+                                    init_config.matformer_tier,
+                                    matches!(
+                                        init_config.matformer_load_strategy,
+                                        MatformerLoadStrategy::Universal
+                                    ),
+                                )
+                                .ok_or(InitRunError::InvalidMatformerTierForPeerConfig {
+                                    tier: init_config.matformer_tier,
+                                })?,
+                                _ => {
+                                    P2pLoadPlan::unchanged(peer_config, init_config.matformer_tier)
+                                }
+                            };
+                            let model_config = serde_json::to_string(&plan.config)?;
 
                             let model_config = match llm.architecture {
                                 model::LLMArchitecture::HfLlama => {
@@ -1555,7 +1745,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
                             let (tx_params_response, rx_params_response) = oneshot::channel();
                             tx_parameters_req
-                                .send((parameter_names, tx_params_response))
+                                .send((
+                                    parameter_names,
+                                    plan.required_ffn_width,
+                                    tx_params_response,
+                                ))
                                 .unwrap();
                             #[allow(clippy::arc_with_non_send_sync)]
                             let parameters = Arc::new(rx_params_response.await.unwrap());
@@ -1565,19 +1759,21 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                     model_config,
                                     parameters,
                                 ),
+                                peer_config_json: Some(plan.config),
                                 tokenizer: Arc::new(tokenizer),
                                 checkpoint_extra_files: vec![],
-                                uses_sliced_checkpoint: false,
-                                matformer_tier_for_loading: init_config.matformer_tier,
+                                uses_sliced_checkpoint: plan.uses_sliced_checkpoint,
+                                matformer_tier_for_loading: plan.matformer_tier_for_loading,
                                 matformer_checkpoint_path: Some("p2p".to_string()),
-                                manifest_base_intermediate_size: None,
-                                sliced_checkpoint_tier: None,
+                                manifest_base_intermediate_size: plan.base_intermediate_size,
+                                sliced_checkpoint_tier: plan.sliced_checkpoint_tier,
                             }
                         }
                         _ => unreachable!(),
                     };
 
                     let source = loaded_checkpoint.source;
+                    let peer_config_json = loaded_checkpoint.peer_config_json;
                     let tokenizer = loaded_checkpoint.tokenizer;
                     let checkpoint_extra_files = loaded_checkpoint.checkpoint_extra_files;
                     let mut uses_sliced_checkpoint = loaded_checkpoint.uses_sliced_checkpoint;
@@ -1606,8 +1802,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     );
 
                     let serialized_config = source.serialize_config()?;
-                    let mut config_json: serde_json::Value =
-                        serde_json::from_str(&serialized_config)?;
+                    let mut config_json: serde_json::Value = match peer_config_json {
+                        Some(config) => config,
+                        None => serde_json::from_str(&serialized_config)?,
+                    };
                     ensure_matformer_checkpoint_metadata(
                         &mut config_json,
                         manifest_base_intermediate_size,
@@ -1821,10 +2019,13 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             RawLoadedModelType::ParallelNativeModels(models)
                         };
 
-                        debug!("Config uploaded: {}", serialized_config);
+                        // Peers need the base width and the tier of this client, because its
+                        // tensors can be narrower than the tensors that they need.
+                        let shared_config = serde_json::to_string(&config_json)?;
+                        debug!("Config uploaded: {}", shared_config);
                         let serialized_tokenizer = tokenizer.to_string(false).unwrap();
                         tx_config
-                            .send((serialized_config.clone(), serialized_tokenizer))
+                            .send((shared_config, serialized_tokenizer))
                             .unwrap();
 
                         let hidden_size = config_json
@@ -1848,10 +2049,21 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             .get("vocab_size")
                             .and_then(|v| v.as_u64());
 
+                        let matformer_holds_full_ffn_weights = !uses_sliced_checkpoint
+                            && match (intermediate_size, base_intermediate_size) {
+                                (Some(local), Some(base)) => local >= base,
+                                _ => true,
+                            };
+
                         let canonical_config = canonicalize_config_for_schema(
                             config_json.clone(),
                             init_config.matformer_tier,
                             uses_sliced_checkpoint,
+                        );
+                        let schema_hash_canonical = schema_hash_for_config(
+                            llm.architecture,
+                            &canonical_config,
+                            &parameter_names,
                         );
                         let schema_info = ModelSchemaInfo {
                             schema_hash_local: schema_hash_for_config(
@@ -1859,11 +2071,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 &config_json,
                                 &parameter_names,
                             ),
-                            schema_hash_canonical: schema_hash_for_config(
-                                llm.architecture,
-                                &canonical_config,
-                                &parameter_names,
-                            ),
+                            schema_hash_canonical,
                             parameter_count: u32::try_from(parameter_names.len())
                                 .unwrap_or(u32::MAX),
                             matformer_tier: init_config.matformer_tier,
@@ -1927,6 +2135,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             parameter_names,
                             matformer_effective_tier: matformer_tier_for_loading,
                             matformer_base_intermediate_size: base_intermediate_size,
+                            matformer_holds_full_ffn_weights,
+                            schema_hash_canonical,
                         })
                     }),
                 model::Checkpoint::Ephemeral => return Err(InitRunError::ModelIsEphemeral),
@@ -2008,6 +2218,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             parameter_names,
             matformer_effective_tier,
             matformer_base_intermediate_size,
+            matformer_holds_full_ffn_weights,
+            schema_hash_canonical,
         } = models.map_err(InitRunError::ModelLoadingThreadCrashed)??;
 
         // TODO add data fetching for verifying, too..
@@ -2154,6 +2366,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             tx_health_check,
             tx_distro_result,
             parameter_names: parameter_names.clone(),
+            schema_hash: schema_hash_canonical,
             matformer_tier: init_config.matformer_tier,
 
             model_task_runner: model_task_runner.clone(),
@@ -2176,6 +2389,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             MatformerCheckpointInfo {
                 effective_tier: matformer_effective_tier,
                 base_intermediate_size: matformer_base_intermediate_size,
+                holds_full_ffn_weights: matformer_holds_full_ffn_weights,
             },
             model_task_runner,
         );

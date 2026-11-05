@@ -50,6 +50,12 @@ pub trait CausalLM: Send {
     fn matformer_tail_grad_stats(&self) -> Option<MatformerTailGradSummary> {
         None
     }
+    /// FFN width that this model trains, when it is narrower than its FFN weights.
+    ///
+    /// A model with sliced weights returns `None`, because its weights already have this width.
+    fn matformer_active_ffn_width(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,6 +90,11 @@ pub trait LanguageModelConfig: ModelConfig + Send + Debug + serde::de::Deseriali
     fn max_position_embeddings(&self) -> usize;
     fn bos_token_id(&self) -> Option<i64>;
     fn eos_token_ids(&self) -> Option<EosToks>;
+
+    /// FFN width that this config trains, when it is narrower than its FFN weights.
+    fn matformer_active_ffn_width(&self) -> Option<i64> {
+        None
+    }
 
     /// Returns softcap scale if logit softcapping is enabled.
     /// Formula: scale * sigmoid(logits / (scale / 4))
@@ -221,6 +232,10 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLanguageModel<M, C> 
 }
 
 impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguageModel<M, C> {
+    fn matformer_active_ffn_width(&self) -> Option<i64> {
+        self.config.matformer_active_ffn_width()
+    }
+
     fn forward(
         &self,
         x: &Tensor,

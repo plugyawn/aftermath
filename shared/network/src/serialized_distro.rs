@@ -27,6 +27,8 @@ pub struct TransmittableDistroResult {
     pub step: u32,
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
+    /// Canonical model schema of the sender. All tiers of one run have the same value.
+    pub schema_hash: [u8; 32],
     pub distro_results: Vec<SerializedDistroResult>,
 }
 
@@ -37,6 +39,7 @@ impl TransmittableDistroResult {
         hasher.update(self.trainer_nonce.to_be_bytes());
         hasher.update(self.batch_id.0.start.to_be_bytes());
         hasher.update(self.batch_id.0.end.to_be_bytes());
+        hasher.update(self.schema_hash);
         for result in &self.distro_results {
             hasher.update((result.parameter_name.len() as u32).to_be_bytes());
             hasher.update(result.parameter_name.as_bytes());

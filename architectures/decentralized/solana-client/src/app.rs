@@ -136,6 +136,8 @@ pub async fn build_app(
             device: p.device,
             matformer_tier: p.matformer_tier,
             matformer_load_strategy: p.matformer_load_strategy,
+            matformer_helper_fraction: p.matformer_helper_fraction,
+            matformer_helper_rotation_interval: p.matformer_helper_rotation_interval,
             log_memory_usage: p.log_memory_usage,
             sidecar_port: p.sidecar_port,
         };

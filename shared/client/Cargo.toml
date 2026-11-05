@@ -27,6 +27,7 @@ tracing.workspace = true
 rand.workspace = true
 futures.workspace = true
 hex = "0.4.3"
+sha2.workspace = true
 lazy_static = "1.5.0"
 wandb = { git = "https://github.com/NousResearch/wandb-rs.git", rev = "ed65ecdc78969c943a755fc45246b94d7390ba5f" }
 rand_chacha.workspace = true

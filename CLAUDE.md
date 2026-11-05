@@ -130,9 +130,9 @@ architecture = "HfLlama"
 
 ## MatFormer Heterogeneous Training Status
 
-**CURRENT STATUS: PRODUCTION-READY** (with helper mode disabled for tier > 0)
+**CURRENT STATUS: RESEARCH** (helper mode disabled for tier > 0)
 
-Mixed-tier training (clients with different `--matformer-tier` values) works correctly. Earlier analysis incorrectly identified several "issues" that are actually expected behavior.
+Mixed-tier training runs in the tests. It has no evidence at real scale yet. For the limits, see `psyche-book/src/explain/matformer.md`.
 
 ### How It Works
 
@@ -143,14 +143,20 @@ Each client trains on **different, non-overlapping batches** within a round:
 This creates **sample rate asymmetry**:
 - Prefix neurons: See gradients from ALL tiers (higher effective sample rate)
 - Suffix neurons: See gradients from tier-0 only (lower effective sample rate)
-- Over pretraining-scale data, both regions see the full data distribution
 
-### Why This Is Mathematically Sound
+### What Holds
 
-1. **Backprop is cleanly separable** - Each client's forward/backward pass is independent
-2. **No cross-contamination** - Tier-1's zeros in suffix positions don't dilute tier-0's gradients
-3. **Sign-SGD makes magnitude irrelevant** - Only gradient direction matters, not scale
-4. **Witnesses verify blob hashes** - Commitment verification uses downloaded blob's xshape, not local model
+1. **Clients send only the width that they train** - A narrow tier never sends the tail, so it cannot change the tail update (`shared/modeling/tests/matformer_distro.rs`)
+2. **All clients decode in Float** - The vote does not depend on device or weight precision
+3. **MPS weights stay on the BF16 grid** - MPS clients track BF16 clients
+4. **The lookahead returns exactly** - Clients with different local errors keep the same consensus weights, and a cancelled step removes its lookahead
+5. **Witnesses verify blob hashes** - Commitment verification uses downloaded blob's xshape, not local model
+
+### What Does Not Hold
+
+- Sign-SGD does not remove magnitude in raw mode. The sum uses peer magnitudes before the sign. Use `quantize_1bit = true` for equal votes.
+- Backprop is separable for one pass only. The tail output changes gradients on all shared weights.
+- AdamW clients do not exchange gradients. Use the Distro optimizer for shared training.
 
 ### Recommended Configuration
 
@@ -198,6 +204,9 @@ This enables:
 | Helper mode + sliced checkpoint | Auto-disabled | Code correctly detects and disables |
 | Double-slicing | Hard error | `validate_no_double_slicing()` prevents misconfiguration |
 | Memory savings (small models) | ~15%, not 50% | Embeddings dominate; larger models save more |
+| Sliced client uploads | Blocked | A sliced client has no FFN tail, so it saves locally and does not publish |
+| P2P join with no wider peer | Hard error | A client stops when no peer has the FFN width that it needs |
+| Tiers | Self-declared | The coordinator does not store or verify a tier |
 
 ### Testing Heterogeneous Training
 

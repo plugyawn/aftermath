@@ -123,7 +123,7 @@ impl Variable for (String, Tensor, Option<Shard>, Option<Arc<Communicator>>) {
     }
 
     fn zeros_like(&self, name: String) -> Box<dyn Variable> {
-        Box::new((name, self.1.empty_like(), self.2, self.3.clone()))
+        Box::new((name, self.1.zeros_like(), self.2, self.3.clone()))
     }
 
     fn set_grad(&self, tensor: Tensor) {
