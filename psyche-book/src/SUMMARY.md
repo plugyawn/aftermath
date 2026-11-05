@@ -1,6 +1,7 @@
 # Summary
 
-- [Intro to Psyche](./intro.md)
+- [Introduction](./intro.md)
+- [Quickstart](./quickstart.md)
 
 - [Psyche in depth](./explain/index.md)
   - [General workflow](./explain/general-workflow.md)

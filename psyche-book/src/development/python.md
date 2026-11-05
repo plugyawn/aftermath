@@ -1,7 +1,6 @@
 # Python Integration
 
-> [!WARNING]
-> Python support is still under development and not production-ready.
+> **Warning:** Python support is still under development and not production-ready.
 > The APIs used to write it are not documented
 > because they are still subject to large amounts of change.
 

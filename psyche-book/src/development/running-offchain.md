@@ -63,7 +63,9 @@ There's a _lot_ of options to configure the local testnet. Check em out below!
 
 <details>
     <summary>Command-line options</summary>
-    {{#include ../../generated/cli/psyche-centralized-local-testnet.md}}
+
+{{#include ../../generated/cli/psyche-centralized-local-testnet.md}}
+
 </details>
 
 ## Server & Client
@@ -72,10 +74,14 @@ Both of these applications can be spun up individually at your discretion instea
 
 <details>
     <summary>Client</summary>
-    {{#include ../../generated/cli/psyche-centralized-client.md}}
+
+{{#include ../../generated/cli/psyche-centralized-client.md}}
+
 </details>
 
 <details>
     <summary>Server</summary>
-    {{#include ../../generated/cli/psyche-centralized-server.md}}
+
+{{#include ../../generated/cli/psyche-centralized-server.md}}
+
 </details>

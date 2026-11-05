@@ -5,7 +5,7 @@ It's a `.toml` file with information about the model shape, size, checkpoints, o
 
 There's two top-level values in a run configuration: a `config`, and a `model`.
 
-While some examples are described below, you can find the full range of options [for the coordinator here](https://github.com/PsycheFoundation/psyche/blob/main/shared/coordinator/src/coordinator.rs) and [for the model here](https://github.com/PsycheFoundation/psyche/blob/main/shared/coordinator/src/model.rs)
+While some examples are described below, you can find the full range of options [for the coordinator here](https://github.com/plugyawn/aftermath/blob/main/shared/coordinator/src/coordinator.rs) and [for the model here](https://github.com/plugyawn/aftermath/blob/main/shared/coordinator/src/model.rs)
 
 ## Config
 
@@ -86,6 +86,7 @@ total_steps = 25000
 final_lr = 4.0e-5
 
 # only the DisTrO optimizer is supported when training models on Psyche.
+# AdamW clients do not exchange gradients, so each AdamW client trains alone.
 [model.LLM.optimizer.Distro]
 clip_grad_norm = 1.0
 compression_decay = 0.999

@@ -1,8 +1,9 @@
 [book]
-authors = ["Nous Research"]
+authors = ["Aftermath contributors", "Nous Research"]
+description = "Documentation for Aftermath, a research fork of Psyche for heterogeneous distributed transformer training."
 language = "en"
 src = "src"
-title = "Psyche"
+title = "Aftermath"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
@@ -14,5 +15,8 @@ additional-js = ["mermaid.min.js", "mermaid-init.js"]
 additional-css = ["./theme/psyche.css"]
 default-theme = "psyche-light"
 preferred-dark-theme = "psyche-dark"
+site-url = "/aftermath/"
+git-repository-url = "https://github.com/plugyawn/aftermath"
+edit-url-template = "https://github.com/plugyawn/aftermath/edit/main/psyche-book/{path}"
 
 [output.linkcheck]

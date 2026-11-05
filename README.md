@@ -8,32 +8,36 @@ This is a research fork of Nous Research's [**Psyche**](https://nousresearch.com
 
 [Matformer: Nested Transformer for Elastic Inference](https://www.prateekjain.org/publications/all_papers/KuduguntaKDCDTHKFJ23.pdf), and subsequent Gemma-3n models show a way to develop _nested_ Transformers that can be trained collaboratively. 
 
-This means that, even though $A'$ only $\~40$% of the size of the full model $A$ (where $A$ is the full model), it is a good gradient estimator for the full model (over the shared $40$%).
+This means that a smaller sub-model $A'$ can share weights with the full model $A$. $A'$ can help to train the part that they share. How much it helps depends on the model and on the size of $A'$ (refer to [What the evidence shows](https://plugyawn.github.io/aftermath/explain/matformer.html#what-the-evidence-shows)).
 Note that $A'$ can still operate as a fully independent GPT-class model.
 
-This property can be used to develop a distributed training method that slices GPT models _width-wise_ (in case of FFNs) and _head-wise_ (in case of attention), distribute smaller chunks over devices with less VRAM, while larger devices hold the full model, and intelligently gather gradients. This also produces strong small models that are verifiably more powerful than if they were distilled from the larger model later for an equivalent budget (effectively for free, considering devices with low VRAM can otherwise simply not join the training run). 
+FFN slicing cannot make $A'$ arbitrarily small, because attention and embeddings stay on every client. On the checkpoint below, the smallest possible $A'$ is 55% of the full model.
+
+This property supports a distributed training method. The method slices GPT models _width-wise_ (in case of FFNs). Devices with less VRAM hold smaller chunks, and larger devices hold the full model. The method gathers gradients from all devices. _Head-wise_ slicing of attention is a planned change. It is not in the code yet.
 <img width="1018" height="647" alt="image" src="https://github.com/user-attachments/assets/01574699-0f18-4ce7-b41e-bf4f14432529" />
 Highlighted in red above is a submodel on a "satellite", trained in tandem with a larger model.
-Both the larger and the smaller submodel outperform a model trained with the same token-budget/time-budget as each of the models independently.
-The smaller model occupies only ~70% of the VRAM of the larger, and the difference grows with size. These models are of the ~124M parameter range, trained on a small slice of FineWeb.
+Both the larger and the smaller submodel show lower `train/loss` than a model trained with the same token-budget/time-budget as each of the models independently. This figure shows training loss, not held-out loss, so it is early evidence only.
+The smaller model occupies only ~70% of the VRAM of the larger, and the difference grows with size. Training used a small slice of FineWeb. The checkpoint name says 124M, but `plugyawn/nanogpt-124m-init` has 190,460,160 parameters.
 
 Here is a little infographic I made about my dreams with `Aftermath`:
 <img width="1215" height="681" alt="image" src="https://github.com/user-attachments/assets/105b1744-e085-4fe5-a34a-47c8fd67bf81" />
+
+This infographic shows a long-term goal. The code does not support phones. A 4 GB phone holds under 1% of a 70B model. A sub-model of 7% gave the full model no benefit in our small tests.
 
 
 ## About the code
 Aftermath is **built on top of Psyche** (PsycheFoundation/psyche) and extends it with MatFormer tiered checkpoints, manifest-based slicing, and practical tooling for mixed‑hardware training.
 For canonical Psyche documentation, see https://docs.psyche.network (upstream). 
 
-This README adds the elastic workflow and fork‑specific details. For more extensive documentation, please host `psyche-book`, available on this repo, and refer to the new Matformer training details.
+This README adds the elastic workflow and fork‑specific details. For more extensive documentation, see the [Aftermath docs](https://plugyawn.github.io/aftermath/), including the [MatFormer training details](https://plugyawn.github.io/aftermath/explain/matformer.html). The source is in `psyche-book/`.
 
 ---
 Aftermath offers, out of the box:
 
 - **Support for Heterogeneous training**:
   - smaller devices train smaller tiers; large devices train full tiers; all contribute to shared weights.
-  - tiered checkpoints pull only the files needed for a given tier (esp. from HF).
-  - schema canonicalization + double‑slicing protection prevents mismatched runs.
+  - tiered checkpoints pull only the files needed for a given tier (esp. from HF). A client that joins over P2P downloads full-width tensors from wider peers and keeps only its prefix.
+  - schema canonicalization + double‑slicing protection detect mismatched clients. They do not verify the tier that a client declares.
   - explicit manifests + metadata give reliable tier detection and validation.
 
 This is possibly through the implementation of a Matryoshka Transformer. Some details, as you look through the code/documentation:

@@ -1,0 +1,106 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - psyche-book/**
+      - architectures/centralized/**
+      - tools/rust-tools/psyche-sidecar/**
+      - secrets.nix
+      - justfile
+      - scripts/psyche-env.sh
+      - .github/workflows/docs.yml
+  pull_request:
+    paths:
+      - psyche-book/**
+      - architectures/centralized/**
+      - tools/rust-tools/psyche-sidecar/**
+      - secrets.nix
+      - justfile
+      - scripts/psyche-env.sh
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libssl-dev perl pkg-config
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # tch-rs links against libtorch. The CLI help output does not use a GPU, so the CPU build is enough.
+      - name: Install PyTorch
+        run: pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install docs tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,mdbook@0.4.47,mdbook-mermaid@0.14.0,mdbook-linkcheck@0.7.7
+
+      - name: Generate CLI reference
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          export CARGO_HOME="$HOME/.cargo"
+          export CARGO_TARGET_DIR="$PWD/target"
+          source scripts/psyche-env.sh
+          just generate_cli_docs
+
+      - name: Build book
+        run: mdbook build psyche-book
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: psyche-book/book/html
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

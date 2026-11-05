@@ -1,5 +1,13 @@
 # CI
 
+## Documentation site
+
+The `Docs` GitHub Actions workflow (`.github/workflows/docs.yml`) builds this book for each pull request that changes it. A push to `main` also deploys the book to <https://plugyawn.github.io/aftermath/>.
+
+## Upstream Psyche CI
+
+The sections below come from upstream Psyche. The hostnames in them belong to upstream Psyche.
+
 ## Overview
 
 We use [Garnix](https://garnix.io/) as our CI provider. It:
